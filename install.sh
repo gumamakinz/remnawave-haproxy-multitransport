@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-VERSION="5.0.0"
+VERSION="5.0.1"
 
 REMNANODE_DIR="/opt/remnanode"
 HAPROXY_DIR="/opt/haproxy"
@@ -18,6 +18,8 @@ YELLOW=$'\033[1;33m'
 ORANGE=$'\033[38;5;208m'
 RED=$'\033[0;31m'
 CYAN=$'\033[0;36m'
+PURPLE=$'\033[38;5;141m'
+PINK=$'\033[38;5;213m'
 BOLD=$'\033[1m'
 RESET=$'\033[0m'
 
@@ -37,21 +39,86 @@ step() {
 }
 
 show_banner() {
-    local -a colors=("$RED" "$ORANGE" "$YELLOW" "$GREEN" "$CYAN")
-    local -a lines=(
-        '██████  ██  ██  ██      ██    ██    ██      ██    ██    ██  ██  ██████  ██    ██  ██████'
-        '██      ██  ██  ████  ████  ██  ██  ████  ████  ██  ██  ██  ██    ██    ████  ██      ██'
-        '██  ██  ██  ██  ██  ██  ██  ██████  ██  ██  ██  ██████  ████      ██    ██  ████    ██  '
-        '██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██    ██    ██  ████  ██    '
-        '██████  ██████  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██████  ██    ██  ██████'
+    local -a colors=(
+        "$RED" "$ORANGE" "$YELLOW" "$GREEN" "$CYAN"
+        "$PURPLE" "$PINK" "$RED" "$ORANGE" "$YELLOW"
     )
-    local i
+    local -a rows=(
+        '█████|█   █|█   █| ███ |█   █| ███ |█  ██|█████|█   █|█████'
+        '█    |█   █|██ ██|█   █|██ ██|█   █|█ ██ |  █  |██  █|   ██'
+        '█ ███|█   █|█ █ █|█████|█ █ █|█████|██   |  █  |█ █ █|  ██ '
+        '█   █|█   █|█   █|█   █|█   █|█   █|█ ██ |  █  |█  ██|██   '
+        '█████|█████|█   █|█   █|█   █|█   █|█  ██|█████|█   █|█████'
+    )
+    local row glyph i
 
     printf '\n'
-    for i in "${!lines[@]}"; do
-        printf '%s%s%s\n' "${colors[$i]}" "${lines[$i]}" "$RESET"
+    for row in "${rows[@]}"; do
+        IFS='|' read -r -a glyphs <<< "$row"
+        for i in "${!glyphs[@]}"; do
+            glyph="${glyphs[$i]}"
+            printf '%s%s%s  ' "${colors[$i]}" "$glyph" "$RESET"
+        done
+        printf '\n'
     done
     printf '\n'
+}
+
+summary_border() {
+    printf '%s%s%s\n' "$ORANGE" \
+        '  ├────────────────────────┼────────────────────────────────────────────┤' \
+        "$RESET"
+}
+
+summary_row() {
+    local label="$1"
+    local value="$2"
+    local value_color="${3:-$GREEN}"
+    local label_padding=$((18 - ${#label}))
+    local value_padding=$((42 - ${#value}))
+
+    (( label_padding < 0 )) && label_padding=0
+    (( value_padding < 0 )) && value_padding=0
+
+    printf '%s  │%s ' "$ORANGE" "$RESET"
+    printf '%s[ %s%*s ]%s ' \
+        "$CYAN" "$label" "$label_padding" '' "$RESET"
+    printf '%s│%s %s%*s' \
+        "$ORANGE" "$value_color" "$value" "$value_padding" ''
+    printf ' %s%s│%s\n' "$RESET" "$ORANGE" "$RESET"
+}
+
+show_configuration_summary() {
+    printf '\n%s%s%s%s\n' "$BOLD" "$YELLOW" \
+        '  ╭────────────── ПРОВЕРЬ ПАРАМЕТРЫ ──────────────╮' "$RESET"
+    printf '%s%s%s\n' "$ORANGE" \
+        '  ┌────────────────────────┬────────────────────────────────────────────┐' \
+        "$RESET"
+    summary_row 'Нода' "$NODE_NAME"
+    summary_row 'Код' "$NODE_CODE" "$YELLOW"
+    summary_border
+    summary_row 'TCP-домен' "$TCP_DOMAIN"
+    summary_row 'XHTTP-домен' "$XHTTP_DOMAIN"
+    summary_row 'gRPC-домен' "$GRPC_DOMAIN"
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        summary_row 'Hysteria2' 'да' "$GREEN"
+        summary_row 'Hysteria-домен' "$HYSTERIA_DOMAIN"
+    else
+        summary_row 'Hysteria2' 'нет' "$YELLOW"
+    fi
+    summary_border
+    summary_row 'TCP tag' "$TCP_TAG" "$YELLOW"
+    summary_row 'XHTTP tag' "$XHTTP_TAG" "$YELLOW"
+    summary_row 'gRPC tag' "$GRPC_TAG" "$YELLOW"
+    summary_row 'XHTTP path' "$XHTTP_PATH" "$CYAN"
+    summary_row 'gRPC service' "$GRPC_SERVICE" "$CYAN"
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        summary_row 'Hysteria tag' "$HYSTERIA_TAG" "$YELLOW"
+        summary_row 'Hysteria port' '443/udp' "$PINK"
+    fi
+    printf '%s%s%s\n' "$ORANGE" \
+        '  └────────────────────────┴────────────────────────────────────────────┘' \
+        "$RESET"
 }
 
 on_error() {
@@ -233,35 +300,14 @@ collect_values() {
             die "Некорректный Hysteria-домен."
     fi
 
-    TCP_TAG="$NODE_NAME"
-    XHTTP_TAG="${NODE_NAME}-XHTTP"
-    GRPC_TAG="${NODE_NAME}-gRPC"
-    HYSTERIA_TAG="${NODE_NAME}-HYSTERIA2"
+    TCP_TAG="${NODE_NAME}-T"
+    XHTTP_TAG="${NODE_NAME}-X"
+    GRPC_TAG="${NODE_NAME}-G"
+    HYSTERIA_TAG="${NODE_NAME}-H"
     XHTTP_PATH="/api/v3/sync/${NODE_CODE}"
     GRPC_SERVICE="api.v3.sync.${NODE_CODE}"
 
-    printf '\n%sПроверь:%s\n' "$BOLD" "$RESET"
-    printf '  Нода:          %s\n' "$NODE_NAME"
-    printf '  Код:           %s\n' "$NODE_CODE"
-    printf '  TCP-домен:     %s\n' "$TCP_DOMAIN"
-    printf '  XHTTP-домен:   %s\n' "$XHTTP_DOMAIN"
-    printf '  gRPC-домен:    %s\n' "$GRPC_DOMAIN"
-    if [[ "$USE_HYSTERIA" == "true" ]]; then
-        printf '  Hysteria2:     да\n'
-        printf '  Hysteria-домен:%s%s\n' '   ' "$HYSTERIA_DOMAIN"
-    else
-        printf '  Hysteria2:     нет\n'
-    fi
-    printf '\n'
-    printf '  TCP tag:       %s\n' "$TCP_TAG"
-    printf '  XHTTP tag:     %s\n' "$XHTTP_TAG"
-    printf '  gRPC tag:      %s\n' "$GRPC_TAG"
-    printf '  XHTTP path:    %s\n' "$XHTTP_PATH"
-    printf '  gRPC service:  %s\n' "$GRPC_SERVICE"
-    if [[ "$USE_HYSTERIA" == "true" ]]; then
-        printf '  Hysteria tag:  %s\n' "$HYSTERIA_TAG"
-        printf '  Hysteria port: 443/udp\n'
-    fi
+    show_configuration_summary
     printf '\n'
 
     confirm "Всё верно, продолжить?" || exit 0
