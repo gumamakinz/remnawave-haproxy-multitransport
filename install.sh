@@ -2,18 +2,22 @@
 set -Eeuo pipefail
 umask 022
 
-VERSION="4.3.0"
+VERSION="5.0.0"
 
 REMNANODE_DIR="/opt/remnanode"
 HAPROXY_DIR="/opt/haproxy"
 CADDY_SOCKET="/dev/shm/nginx.sock"
+STATE_DIR="/var/lib/remnawave-haproxy-multitransport"
+STATE_FILE="$STATE_DIR/install-state.txt"
 WAIT_TIMEOUT=900
+HYSTERIA_CERT_FILE="/var/lib/remnawave/configs/xray/ssl/fullchain.pem"
+HYSTERIA_KEY_FILE="/var/lib/remnawave/configs/xray/ssl/privkey.key"
 
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[1;33m'
 ORANGE=$'\033[38;5;208m'
 RED=$'\033[0;31m'
-BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
 BOLD=$'\033[1m'
 RESET=$'\033[0m'
 
@@ -21,15 +25,33 @@ BACKUP_DIR=""
 
 ok()   { printf '%s✅ %s%s\n' "$GREEN" "$*" "$RESET"; }
 warn() { printf '%s⚠ %s%s\n' "$YELLOW" "$*" "$RESET"; }
-info() { printf '%sℹ %s%s\n' "$BLUE" "$*" "$RESET"; }
+info() { printf '%sℹ %s%s\n' "$YELLOW" "$*" "$RESET"; }
 die()  { printf '%s❌ %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
 
 step() {
     local title="$1"
-    local color="${2:-$BLUE}"
+    local color="${2:-$YELLOW}"
 
     printf '\n%s%s%s%s\n' \
         "$BOLD" "$color" "$title" "$RESET"
+}
+
+show_banner() {
+    local -a colors=("$RED" "$ORANGE" "$YELLOW" "$GREEN" "$CYAN")
+    local -a lines=(
+        '██████  ██  ██  ██      ██    ██    ██      ██    ██    ██  ██  ██████  ██    ██  ██████'
+        '██      ██  ██  ████  ████  ██  ██  ████  ████  ██  ██  ██  ██    ██    ████  ██      ██'
+        '██  ██  ██  ██  ██  ██  ██  ██████  ██  ██  ██  ██████  ████      ██    ██  ████    ██  '
+        '██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██    ██    ██  ████  ██    '
+        '██████  ██████  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██  ██████  ██    ██  ██████'
+    )
+    local i
+
+    printf '\n'
+    for i in "${!lines[@]}"; do
+        printf '%s%s%s\n' "${colors[$i]}" "${lines[$i]}" "$RESET"
+    done
+    printf '\n'
 }
 
 on_error() {
@@ -80,6 +102,12 @@ confirm() {
     [[ "$answer" =~ ^[YyДд]$ ]]
 }
 
+confirm_optional() {
+    local answer=""
+    read -r -p "$1 [y/N]: " answer
+    [[ "$answer" =~ ^[YyДд]$ ]]
+}
+
 valid_domain() {
     [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
 }
@@ -98,6 +126,28 @@ local_port_ready() {
     local port="$1"
     ss -ltnp 2>/dev/null |
         grep -qE "127\.0\.0\.1:${port}[[:space:]]"
+}
+
+udp_port_owner() {
+    local port="$1"
+    ss -lunp 2>/dev/null |
+        awk -v suffix=":${port}" '$4 ~ suffix"$" {print}'
+}
+
+udp_port_ready() {
+    local port="$1"
+    ss -lunp 2>/dev/null |
+        awk -v suffix=":${port}" '$4 ~ suffix"$" {found=1} END {exit !found}'
+}
+
+all_xray_inbounds_ready() {
+    local_port_ready 1443 &&
+        local_port_ready 2443 &&
+        local_port_ready 3443 || return 1
+
+    if [[ "${USE_HYSTERIA:-false}" == "true" ]]; then
+        udp_port_ready 443 || return 1
+    fi
 }
 
 detect_caddy_container() {
@@ -155,6 +205,17 @@ collect_values() {
         "${YELLOW}gRPC-домен${RESET}, например ${GREEN}rw-ee01g.example.ru${RESET}" \
         "Отдельный адрес для gRPC Reality. DNS-запись должна указывать на этот сервер."
 
+    USE_HYSTERIA="false"
+    HYSTERIA_DOMAIN=""
+
+    printf '\n  Hysteria2 работает напрямую через Xray на 443/udp и не проходит через HAProxy.\n'
+    if confirm_optional "Добавить Hysteria2 на эту ноду?"; then
+        USE_HYSTERIA="true"
+        ask HYSTERIA_DOMAIN \
+            "${YELLOW}Hysteria-домен${RESET}, например ${GREEN}rw-ee01h.example.ru${RESET}" \
+            "Домен для Hysteria2 TLS. DNS-запись должна указывать на этот сервер."
+    fi
+
     valid_code "$NODE_CODE" ||
         die "Короткий код должен содержать строчные буквы, цифры, _ или -."
 
@@ -167,9 +228,15 @@ collect_values() {
     valid_domain "$GRPC_DOMAIN" ||
         die "Некорректный gRPC-домен."
 
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        valid_domain "$HYSTERIA_DOMAIN" ||
+            die "Некорректный Hysteria-домен."
+    fi
+
     TCP_TAG="$NODE_NAME"
     XHTTP_TAG="${NODE_NAME}-XHTTP"
     GRPC_TAG="${NODE_NAME}-gRPC"
+    HYSTERIA_TAG="${NODE_NAME}-HYSTERIA2"
     XHTTP_PATH="/api/v3/sync/${NODE_CODE}"
     GRPC_SERVICE="api.v3.sync.${NODE_CODE}"
 
@@ -179,12 +246,22 @@ collect_values() {
     printf '  TCP-домен:     %s\n' "$TCP_DOMAIN"
     printf '  XHTTP-домен:   %s\n' "$XHTTP_DOMAIN"
     printf '  gRPC-домен:    %s\n' "$GRPC_DOMAIN"
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        printf '  Hysteria2:     да\n'
+        printf '  Hysteria-домен:%s%s\n' '   ' "$HYSTERIA_DOMAIN"
+    else
+        printf '  Hysteria2:     нет\n'
+    fi
     printf '\n'
     printf '  TCP tag:       %s\n' "$TCP_TAG"
     printf '  XHTTP tag:     %s\n' "$XHTTP_TAG"
     printf '  gRPC tag:      %s\n' "$GRPC_TAG"
     printf '  XHTTP path:    %s\n' "$XHTTP_PATH"
     printf '  gRPC service:  %s\n' "$GRPC_SERVICE"
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        printf '  Hysteria tag:  %s\n' "$HYSTERIA_TAG"
+        printf '  Hysteria port: 443/udp\n'
+    fi
     printf '\n'
 
     confirm "Всё верно, продолжить?" || exit 0
@@ -225,12 +302,17 @@ preflight() {
     local public_ip=""
     local domain=""
     local addresses=""
+    local -a domains=("$TCP_DOMAIN" "$XHTTP_DOMAIN" "$GRPC_DOMAIN")
+
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        domains+=("$HYSTERIA_DOMAIN")
+    fi
 
     public_ip="$(external_ipv4)"
     [[ -n "$public_ip" ]] &&
         info "Внешний IPv4: $public_ip"
 
-    for domain in "$TCP_DOMAIN" "$XHTTP_DOMAIN" "$GRPC_DOMAIN"; do
+    for domain in "${domains[@]}"; do
         addresses="$(resolve_ipv4 "$domain" || true)"
 
         if [[ -z "$addresses" ]]; then
@@ -245,6 +327,21 @@ preflight() {
             warn "$domain не указывает на $public_ip."
         fi
     done
+
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        local udp_owner=""
+        udp_owner="$(udp_port_owner 443 || true)"
+
+        if [[ -n "$udp_owner" ]]; then
+            info "Текущий владелец 443/udp: $udp_owner"
+        else
+            ok "443/udp свободен для Hysteria2."
+        fi
+
+        warn "TLS-сертификат Hysteria2 должен быть установлен на сервере Remnawave Panel."
+        info "Certificate: $HYSTERIA_CERT_FILE"
+        info "Private key: $HYSTERIA_KEY_FILE"
+    fi
 }
 
 backup_configs() {
@@ -270,11 +367,29 @@ backup_configs() {
     fi
 
     ss -ltnp > "$BACKUP_DIR/ports-before.txt" || true
+    ss -lunp > "$BACKUP_DIR/ports-udp-before.txt" || true
     docker ps --format \
         'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' \
         > "$BACKUP_DIR/docker-before.txt" || true
 
     ok "Бэкап: $BACKUP_DIR"
+}
+
+configure_hysteria_prerequisites() {
+    [[ "$USE_HYSTERIA" == "true" ]] || return 0
+
+    step "Подготовка Hysteria2"
+
+    if command -v ufw >/dev/null 2>&1 &&
+       ufw status 2>/dev/null | grep -q '^Status: active'; then
+        ufw allow 443/udp comment 'Hysteria2' >/dev/null
+        ok "UFW: разрешён входящий 443/udp."
+    else
+        info "Активный UFW не обнаружен: локальное правило не требуется."
+    fi
+
+    warn "Если у хостера есть внешний firewall, разреши в нём 443/udp."
+    ok "Hysteria2 будет запущена Xray; отдельный контейнер не требуется."
 }
 
 configure_caddy() {
@@ -424,14 +539,12 @@ EOF
 wait_for_xray() {
     step "Ожидание конфигурации Xray"
 
-    if local_port_ready 1443 &&
-       local_port_ready 2443 &&
-       local_port_ready 3443; then
-        ok "Все три Xray inbound уже работают."
+    if all_xray_inbounds_ready; then
+        ok "Все выбранные Xray inbound уже работают."
         return 0
     fi
 
-    printf '\n%sВ Remnawave Panel создай три inbound:%s\n' \
+    printf '\n%sВ Remnawave Panel создай указанные inbound:%s\n' \
         "$BOLD" "$RESET"
 
     cat <<EOF
@@ -466,6 +579,63 @@ gRPC Reality
 privateKey и shortId оставь в Xray Template панели.
 EOF
 
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        cat <<EOF
+
+Hysteria2
+  tag:             ${HYSTERIA_TAG}
+  listen:          0.0.0.0
+  port:            443/udp
+  protocol:        hysteria
+  version:         2
+  network:         hysteria
+  security:        tls
+  serverName:      ${HYSTERIA_DOMAIN}
+  ALPN:            h3
+  congestion:      bbr
+  certificateFile: ${HYSTERIA_CERT_FILE}
+  keyFile:         ${HYSTERIA_KEY_FILE}
+
+Важно: сертификат и ключ должны находиться на сервере Remnawave Panel.
+Панель сама передаст их на ноду при Redeploy.
+
+Готовый объект inbound для добавления в массив inbounds:
+{
+  "tag": "${HYSTERIA_TAG}",
+  "port": 443,
+  "listen": "0.0.0.0",
+  "protocol": "hysteria",
+  "settings": {
+    "clients": [],
+    "version": 2
+  },
+  "streamSettings": {
+    "network": "hysteria",
+    "security": "tls",
+    "finalmask": {
+      "quicParams": {
+        "debug": false,
+        "congestion": "bbr"
+      }
+    },
+    "tlsSettings": {
+      "alpn": ["h3"],
+      "serverName": "${HYSTERIA_DOMAIN}",
+      "certificates": [
+        {
+          "keyFile": "${HYSTERIA_KEY_FILE}",
+          "certificateFile": "${HYSTERIA_CERT_FILE}"
+        }
+      ]
+    },
+    "hysteriaSettings": {
+      "version": 2
+    }
+  }
+}
+EOF
+    fi
+
     read -r -p \
         "После сохранения шаблона и Redeploy/Restart нажми Enter..."
 
@@ -474,6 +644,7 @@ EOF
     local tcp
     local xhttp
     local grpc
+    local hysteria
 
     start_time="$(date +%s)"
 
@@ -481,17 +652,21 @@ EOF
         tcp="нет"
         xhttp="нет"
         grpc="нет"
+        hysteria="выкл"
 
         local_port_ready 1443 && tcp="OK"
         local_port_ready 2443 && xhttp="OK"
         local_port_ready 3443 && grpc="OK"
 
-        printf '\rTCP=%-3s  XHTTP=%-3s  gRPC=%-3s' \
-            "$tcp" "$xhttp" "$grpc"
+        if [[ "$USE_HYSTERIA" == "true" ]]; then
+            hysteria="нет"
+            udp_port_ready 443 && hysteria="OK"
+        fi
 
-        if [[ "$tcp" == "OK" &&
-              "$xhttp" == "OK" &&
-              "$grpc" == "OK" ]]; then
+        printf '\rTCP=%-3s  XHTTP=%-3s  gRPC=%-3s  Hysteria2=%-4s' \
+            "$tcp" "$xhttp" "$grpc" "$hysteria"
+
+        if all_xray_inbounds_ready; then
             printf '\n'
             ok "Все Xray inbound работают."
             return 0
@@ -503,6 +678,8 @@ EOF
             printf '\n'
             ss -ltnp |
                 grep -E ':443|:1443|:2443|:3443' || true
+            [[ "$USE_HYSTERIA" == "true" ]] &&
+                ss -lunp | grep -E ':443' || true
             die "Истекло время ожидания Xray inbound."
         fi
 
@@ -560,6 +737,12 @@ final_status() {
         ok "127.0.0.1:3443 → Xray gRPC" ||
         warn "Нет 127.0.0.1:3443"
 
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        udp_port_ready 443 &&
+            ok "443/udp → Xray Hysteria2" ||
+            warn "Нет Hysteria2 на 443/udp"
+    fi
+
     [[ -S "$CADDY_SOCKET" ]] &&
         ok "$CADDY_SOCKET → Caddy" ||
         warn "Caddy socket отсутствует"
@@ -603,13 +786,82 @@ ${NODE_NAME} gRPC
   Fingerprint: Random
 EOF
 
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        cat <<EOF
+
+${NODE_NAME} Hysteria2
+  Inbound:     ${HYSTERIA_TAG}
+  Address:     ${HYSTERIA_DOMAIN}
+  Port:        443
+  Network:     hysteria
+  Security:    tls
+  SNI:         ${HYSTERIA_DOMAIN}
+  ALPN:        h3
+EOF
+    fi
+
     printf '\n'
     info "HAProxy logs: docker logs -f haproxy"
     info "Бэкап: $BACKUP_DIR"
     ok "Настройка завершена."
 }
 
+check_previous_install() {
+    local detected="false"
+
+    step "Проверка предыдущей установки"
+
+    if [[ -f "$STATE_FILE" ]]; then
+        detected="true"
+        warn "Найдена отметка о предыдущем запуске этого скрипта:"
+        sed 's/^/  /' "$STATE_FILE"
+    elif [[ -f "$HAPROXY_DIR/haproxy.cfg" ||
+            -f "$HAPROXY_DIR/docker-compose.yml" ]]; then
+        detected="true"
+        warn "Найдена существующая конфигурация HAProxy в $HAPROXY_DIR."
+        info "Вероятно, нода уже настраивалась старой версией скрипта."
+    elif command -v docker >/dev/null 2>&1 &&
+         docker inspect haproxy >/dev/null 2>&1; then
+        detected="true"
+        warn "Найден существующий контейнер HAProxy."
+    else
+        ok "Предыдущая установка не обнаружена."
+    fi
+
+    if [[ "$detected" == "true" ]]; then
+        printf '\n'
+        confirm "Продолжить повторную настройку с созданием нового бэкапа?" || exit 0
+    fi
+}
+
+write_install_state() {
+    local temporary=""
+
+    install -d -m 700 "$STATE_DIR"
+    temporary="$(mktemp "$STATE_DIR/.install-state.XXXXXX")"
+
+    {
+        printf 'installed_at=%s\n' "$(date --iso-8601=seconds)"
+        printf 'installer_version=%s\n' "$VERSION"
+        printf 'node_name=%s\n' "$NODE_NAME"
+        printf 'node_code=%s\n' "$NODE_CODE"
+        printf 'tcp_domain=%s\n' "$TCP_DOMAIN"
+        printf 'xhttp_domain=%s\n' "$XHTTP_DOMAIN"
+        printf 'grpc_domain=%s\n' "$GRPC_DOMAIN"
+        printf 'hysteria_enabled=%s\n' "$USE_HYSTERIA"
+        if [[ "$USE_HYSTERIA" == "true" ]]; then
+            printf 'hysteria_domain=%s\n' "$HYSTERIA_DOMAIN"
+        fi
+    } > "$temporary"
+
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$STATE_FILE"
+    ok "Сохранена отметка установки: $STATE_FILE"
+}
+
 show_intro() {
+    show_banner
+
     printf '%sRemnawave multi-transport installer v%s%s\n' \
         "$BOLD" "$VERSION" "$RESET"
 
@@ -619,7 +871,8 @@ show_intro() {
     printf '  • Создаёт резервную копию текущих конфигураций.\n'
     printf '  • Настраивает Caddy и HAProxy.\n'
     printf '  • Ограничивает логи HAProxy тремя файлами по 10 МБ.\n'
-    printf '  • Показывает параметры трёх inbound для Remnawave Panel.\n'
+    printf '  • Опционально добавляет Hysteria2 на 443/udp через Xray.\n'
+    printf '  • Показывает параметры inbound для Remnawave Panel.\n'
     printf '  • Дожидается запуска inbound и выводит готовые параметры Hosts.\n'
 }
 
@@ -628,11 +881,16 @@ status_only() {
     need_cmd docker
     need_cmd ss
 
+    show_banner
+
     printf '%sRemnawave multi-transport installer v%s%s\n\n' \
         "$BOLD" "$VERSION" "$RESET"
 
     ss -ltnp |
         grep -E ':80|:443|:2222|:1443|:2443|:3443' || true
+
+    ss -lunp |
+        grep -E ':443' || true
 
     printf '\n'
 
@@ -645,6 +903,11 @@ status_only() {
     [[ -S "$CADDY_SOCKET" ]] &&
         ok "Caddy socket: OK" ||
         warn "Caddy socket: MISSING"
+
+    if [[ -f "$STATE_FILE" ]]; then
+        printf '\n%sПоследняя установка:%s\n' "$BOLD" "$RESET"
+        sed 's/^/  /' "$STATE_FILE"
+    fi
 }
 
 preview_only() {
@@ -687,15 +950,20 @@ EOF
     warn "Обычный режим изменит конфигурации Caddy и HAProxy на этом сервере."
 
     need_root
+    check_previous_install
 
     collect_values
     preflight
     backup_configs
+    configure_hysteria_prerequisites
     configure_caddy
     configure_haproxy
     wait_for_xray
     start_haproxy
     final_status
+    write_install_state
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
