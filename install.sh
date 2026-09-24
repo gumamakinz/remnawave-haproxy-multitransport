@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-VERSION="5.0.1"
+VERSION="5.1.0"
 
 REMNANODE_DIR="/opt/remnanode"
 HAPROXY_DIR="/opt/haproxy"
@@ -96,6 +96,7 @@ show_configuration_summary() {
         "$RESET"
     summary_row 'Нода' "$NODE_NAME"
     summary_row 'Код' "$NODE_CODE" "$YELLOW"
+    summary_row 'Основной домен' "$BASE_DOMAIN" "$CYAN"
     summary_border
     summary_row 'TCP-домен' "$TCP_DOMAIN"
     summary_row 'XHTTP-домен' "$XHTTP_DOMAIN"
@@ -179,6 +180,10 @@ valid_domain() {
     [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
 }
 
+valid_host_label() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
 valid_code() {
     [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{1,31}$ ]]
 }
@@ -260,17 +265,21 @@ collect_values() {
         "${YELLOW}Короткий код${RESET}, например ${GREEN}ee01${RESET}" \
         "Уникальный код ноды. Из него формируются XHTTP path и gRPC serviceName."
 
-    ask TCP_DOMAIN \
-        "${YELLOW}TCP-домен${RESET}, например ${GREEN}rw-ee01.example.ru${RESET}" \
-        "Адрес для TCP Reality. DNS-запись должна указывать на этот сервер."
+    ask BASE_DOMAIN \
+        "${YELLOW}Основной домен${RESET}, например ${GREEN}example.ru${RESET}" \
+        "Укажи домен один раз. Скрипт автоматически добавит его ко всем именам хостов."
 
-    ask XHTTP_DOMAIN \
-        "${YELLOW}XHTTP-домен${RESET}, например ${GREEN}rw-ee01x.example.ru${RESET}" \
-        "Отдельный адрес для XHTTP Reality. DNS-запись должна указывать на этот сервер."
+    ask TCP_HOST \
+        "${YELLOW}TCP-имя${RESET}, например ${GREEN}rw-ee01${RESET}" \
+        "Только имя хоста без основного домена. Итог: имя.${BASE_DOMAIN}"
 
-    ask GRPC_DOMAIN \
-        "${YELLOW}gRPC-домен${RESET}, например ${GREEN}rw-ee01g.example.ru${RESET}" \
-        "Отдельный адрес для gRPC Reality. DNS-запись должна указывать на этот сервер."
+    ask XHTTP_HOST \
+        "${YELLOW}XHTTP-имя${RESET}, например ${GREEN}rw-ee01x${RESET}" \
+        "Только имя хоста без основного домена. Итог: имя.${BASE_DOMAIN}"
+
+    ask GRPC_HOST \
+        "${YELLOW}gRPC-имя${RESET}, например ${GREEN}rw-ee01g${RESET}" \
+        "Только имя хоста без основного домена. Итог: имя.${BASE_DOMAIN}"
 
     USE_HYSTERIA="false"
     HYSTERIA_DOMAIN=""
@@ -278,26 +287,36 @@ collect_values() {
     printf '\n  Hysteria2 работает напрямую через Xray на 443/udp и не проходит через HAProxy.\n'
     if confirm_optional "Добавить Hysteria2 на эту ноду?"; then
         USE_HYSTERIA="true"
-        ask HYSTERIA_DOMAIN \
-            "${YELLOW}Hysteria-домен${RESET}, например ${GREEN}rw-ee01h.example.ru${RESET}" \
-            "Домен для Hysteria2 TLS. DNS-запись должна указывать на этот сервер."
+        ask HYSTERIA_HOST \
+            "${YELLOW}Hysteria-имя${RESET}, например ${GREEN}rw-ee01h${RESET}" \
+            "Только имя хоста без основного домена. Итог: имя.${BASE_DOMAIN}"
     fi
 
     valid_code "$NODE_CODE" ||
         die "Короткий код должен содержать строчные буквы, цифры, _ или -."
 
-    valid_domain "$TCP_DOMAIN" ||
-        die "Некорректный TCP-домен."
+    valid_domain "$BASE_DOMAIN" ||
+        die "Некорректный основной домен. Пример: example.ru"
 
-    valid_domain "$XHTTP_DOMAIN" ||
-        die "Некорректный XHTTP-домен."
+    valid_host_label "$TCP_HOST" ||
+        die "Некорректное TCP-имя. Введи только имя хоста, например rw-ee01."
 
-    valid_domain "$GRPC_DOMAIN" ||
-        die "Некорректный gRPC-домен."
+    valid_host_label "$XHTTP_HOST" ||
+        die "Некорректное XHTTP-имя. Введи только имя хоста, например rw-ee01x."
+
+    valid_host_label "$GRPC_HOST" ||
+        die "Некорректное gRPC-имя. Введи только имя хоста, например rw-ee01g."
 
     if [[ "$USE_HYSTERIA" == "true" ]]; then
-        valid_domain "$HYSTERIA_DOMAIN" ||
-            die "Некорректный Hysteria-домен."
+        valid_host_label "$HYSTERIA_HOST" ||
+            die "Некорректное Hysteria-имя. Введи только имя хоста, например rw-ee01h."
+    fi
+
+    TCP_DOMAIN="${TCP_HOST}.${BASE_DOMAIN}"
+    XHTTP_DOMAIN="${XHTTP_HOST}.${BASE_DOMAIN}"
+    GRPC_DOMAIN="${GRPC_HOST}.${BASE_DOMAIN}"
+    if [[ "$USE_HYSTERIA" == "true" ]]; then
+        HYSTERIA_DOMAIN="${HYSTERIA_HOST}.${BASE_DOMAIN}"
     fi
 
     TCP_TAG="${NODE_NAME}-T"
@@ -891,11 +910,16 @@ write_install_state() {
         printf 'installer_version=%s\n' "$VERSION"
         printf 'node_name=%s\n' "$NODE_NAME"
         printf 'node_code=%s\n' "$NODE_CODE"
+        printf 'base_domain=%s\n' "$BASE_DOMAIN"
+        printf 'tcp_host=%s\n' "$TCP_HOST"
+        printf 'xhttp_host=%s\n' "$XHTTP_HOST"
+        printf 'grpc_host=%s\n' "$GRPC_HOST"
         printf 'tcp_domain=%s\n' "$TCP_DOMAIN"
         printf 'xhttp_domain=%s\n' "$XHTTP_DOMAIN"
         printf 'grpc_domain=%s\n' "$GRPC_DOMAIN"
         printf 'hysteria_enabled=%s\n' "$USE_HYSTERIA"
         if [[ "$USE_HYSTERIA" == "true" ]]; then
+            printf 'hysteria_host=%s\n' "$HYSTERIA_HOST"
             printf 'hysteria_domain=%s\n' "$HYSTERIA_DOMAIN"
         fi
     } > "$temporary"
